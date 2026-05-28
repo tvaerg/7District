@@ -1,0 +1,26 @@
+# Secrets
+.env
+.env.*
+*.key
+secrets/
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# Data och output
+*.pdf
+*.docx
+*.pptx
+data/
+output/
+uploads/
+
+# OS och editor
+.DS_Store
+.vscode/
+.idea/
