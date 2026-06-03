@@ -21,8 +21,6 @@ Robustness (why this is more than a happy-path reader)
 ------------------------------------------------------
 * Retry + backoff on EVERY Gemini call (upload AND generate), not just upload.
 * PDF size / page-count guard with a warning before burning tokens.
-* Disk cache of Gemini output keyed by file content hash -- monthly reruns and
-  dev iterations don't re-pay for unchanged files. Clear with --no-cache.
 * Defensive PPTX walk: recurses into grouped shapes, pulls chart category/series
   data, and captures speaker notes -- so data buried off the main text frame is
   not silently lost.
@@ -32,8 +30,8 @@ Robustness (why this is more than a happy-path reader)
 Design notes
 ------------
 * SELF-CONTAINED. No imports from VAERG. Patterns are borrowed (Gemini upload +
-  poll + cleanup; robust retry; content cache), the code is rewritten for
-  handover to 7D.
+  patterns are borrowed (Gemini upload + poll + cleanup; robust retry), the
+  code is rewritten for handover to 7D.
 * CUSTODIAL lens. These are 7D's OWN portfolio companies reporting to their
   owner -- not a seller pitching an IM. The deep read looks for what the owner
   must ACT ON, not for what someone is "hiding".
@@ -49,7 +47,6 @@ from __future__ import annotations
 import os
 import time
 import json
-import hashlib
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Callable, Any
@@ -75,6 +72,7 @@ _load_env()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-3.1-pro-preview")  # native PDF
 _PDF_EXTS = {".pdf"}
 _PPTX_EXTS = {".pptx", ".ppt"}
+_XLSX_EXTS = {".xlsx", ".xlsm"}
 
 # Guard rails. Reports are normally 5-25 pages; flag anything unusually large
 # before we spend tokens, but do not hard-block (operator may legitimately have
@@ -85,9 +83,6 @@ WARN_PDF_PAGES = 60
 # Retry policy for Gemini calls.
 _MAX_RETRIES = 5
 _BACKOFF_BASE_S = 3  # 3, 6, 9, 12 ...
-
-# Cache for Gemini output, keyed by file content hash. Lives next to outputs.
-CACHE_DIR = Path(__file__).resolve().parent.parent / "output" / ".gemini_cache"
 
 
 # -----------------------------------------------------------------------------
@@ -101,19 +96,26 @@ class RawCompanyMaterial:
     transcription for PDFs; defensive python-pptx extraction for PPTX).
     `deep_read` holds the custodial soft-signal notes (PDF path). `source_kind`
     tells the reasoning layer how much to trust table fidelity. `warnings`
-    holds non-fatal issues (e.g. oversized PDF, cache miss) distinct from
+    holds non-fatal issues (e.g. oversized PDF) distinct from
     `errors` (which mean the material is incomplete or unusable).
     """
     canonical_name: str
     category: str
     source_file: str
-    source_kind: str                       # "pdf_gemini" | "pptx_text" | "unknown"
+    source_kind: str                       # "pdf_gemini" | "pptx_text" | "xlsx_kpi" | "unknown"
     body_text: str = ""
-    deep_read: Optional[dict] = None        # custodial notes; None for pptx
+    deep_read: Optional[dict] = None        # custodial notes; None for pptx/xlsx
     static: dict = field(default_factory=dict)   # registry static fields
     warnings: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
-    meta: dict = field(default_factory=dict)     # page count, bytes, cache hit, etc.
+    meta: dict = field(default_factory=dict)     # page count, bytes, etc.
+
+    # Multi-file bundle support: when several files exist for one company they
+    # are MERGED into one material (see bundle_materials() in the pipeline).
+    # `sources` lists every file that contributed; `kpis` carries deterministic
+    # numeric snapshots from any xlsx files.
+    sources: list[str] = field(default_factory=list)
+    kpis: list[dict] = field(default_factory=list)  # one KpiSnapshot.to_json() per xlsx
 
     @property
     def ok(self) -> bool:
@@ -126,15 +128,6 @@ class RawCompanyMaterial:
 # -----------------------------------------------------------------------------
 # Shared helpers
 # -----------------------------------------------------------------------------
-def _file_hash(path: str | Path) -> str:
-    """SHA1 of file bytes -- stable cache key that changes iff the file changes."""
-    h = hashlib.sha1()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def _robust_json(text: str) -> Optional[dict]:
     """Parse JSON that may be wrapped in prose or code fences."""
     if not text:
@@ -178,33 +171,6 @@ def _with_retries(fn: Callable[[], Any], label: str) -> Any:
 
 
 # -----------------------------------------------------------------------------
-# Cache
-# -----------------------------------------------------------------------------
-def _cache_path(content_hash: str) -> Path:
-    return CACHE_DIR / f"{content_hash}.json"
-
-
-def _cache_load(content_hash: str) -> Optional[dict]:
-    p = _cache_path(content_hash)
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:                              # noqa: BLE001
-            return None
-    return None
-
-
-def _cache_store(content_hash: str, payload: dict) -> None:
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        _cache_path(content_hash).write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-    except Exception:                                  # noqa: BLE001
-        pass  # caching is best-effort; never fail ingestion over it
-
-
-# -----------------------------------------------------------------------------
 # PDF PATH -- Gemini native, two-phase custodial
 # -----------------------------------------------------------------------------
 def _configure_gemini():
@@ -214,9 +180,11 @@ def _configure_gemini():
         raise RuntimeError(
             "google-generativeai not installed -- run: pip install -r requirements.txt"
         )
-    key = os.getenv("GEMINI_API_KEY")
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not key:
-        raise RuntimeError("GEMINI_API_KEY not set -- required for the PDF path.")
+        raise RuntimeError(
+            "Neither GEMINI_API_KEY nor GOOGLE_API_KEY set -- required for the PDF path."
+        )
     genai.configure(api_key=key)
     return genai
 
@@ -308,7 +276,7 @@ Rules:
 - Output plain text only."""
 
 
-def ingest_pdf(pdf_path: str, rec: CompanyRecord, use_cache: bool = True) -> RawCompanyMaterial:
+def ingest_pdf(pdf_path: str, rec: CompanyRecord) -> RawCompanyMaterial:
     """PDF path: Gemini native read -> transcription + custodial deep-read notes."""
     material = RawCompanyMaterial(
         canonical_name=rec.canonical_name, category=rec.category,
@@ -338,22 +306,7 @@ def ingest_pdf(pdf_path: str, rec: CompanyRecord, use_cache: bool = True) -> Raw
                 f"PDF has {pages} pages (> {WARN_PDF_PAGES}) -- large context, watch cost/limits."
             )
 
-    # --- Cache check ---
-    chash = _file_hash(pdf_path)
-    material.meta["content_hash"] = chash
-    if use_cache:
-        cached = _cache_load(chash)
-        if cached:
-            material.body_text = cached.get("body_text", "")
-            material.deep_read = cached.get("deep_read")
-            material.meta["cache_hit"] = True
-            print(f"      💾 cache hit -- skipping Gemini")
-            if not material.body_text:
-                material.errors.append("cached transcription was empty")
-            return material
-    material.meta["cache_hit"] = False
-
-    # --- Gemini calls ---
+    # --- Gemini calls (always fresh; no caching) ---
     try:
         genai = _configure_gemini()
     except RuntimeError as e:
@@ -386,10 +339,6 @@ def ingest_pdf(pdf_path: str, rec: CompanyRecord, use_cache: bool = True) -> Raw
         material.body_text = (getattr(tr, "text", "") or "").strip()
         if not material.body_text:
             material.errors.append("Gemini returned an empty transcription")
-
-        # Store cache only on a clean read.
-        if use_cache and material.body_text and not material.errors:
-            _cache_store(chash, {"body_text": material.body_text, "deep_read": material.deep_read})
 
     except Exception as e:                             # noqa: BLE001
         material.errors.append(f"gemini_error: {e}")
@@ -501,9 +450,72 @@ def ingest_pptx(pptx_path: str, rec: CompanyRecord) -> RawCompanyMaterial:
 
 
 # -----------------------------------------------------------------------------
+# XLSX PATH -- deterministic KPI extraction + readable text dump for context
+# -----------------------------------------------------------------------------
+def ingest_xlsx(xlsx_path: str, rec: CompanyRecord) -> RawCompanyMaterial:
+    """Excel path: pull structured KPIs deterministically, and dump readable
+    sheet text as backup context. Both go into RawCompanyMaterial."""
+    material = RawCompanyMaterial(
+        canonical_name=rec.canonical_name, category=rec.category,
+        source_file=str(xlsx_path), source_kind="xlsx_kpi",
+        static=rec.display_dict(),
+    )
+    p = Path(xlsx_path)
+    if not p.exists():
+        material.errors.append(f"file not found: {xlsx_path}")
+        return material
+    if p.stat().st_size == 0:
+        material.errors.append("file is empty (0 bytes)")
+        return material
+
+    # Deterministic KPI extraction.
+    from sevend_xlsx_kpi import extract_kpis_from_xlsx, render_kpis_for_prompt
+    try:
+        snap = extract_kpis_from_xlsx(xlsx_path)
+    except Exception as e:                             # noqa: BLE001
+        material.errors.append(f"kpi extractor crashed: {e}")
+        return material
+    if not snap.is_empty():
+        material.kpis.append(snap.to_json())
+    else:
+        material.warnings.append(
+            "no KPIs extracted (no recognised labels); xlsx will only contribute raw text"
+        )
+        if snap.notes:
+            material.warnings.append("; ".join(snap.notes))
+
+    # Readable text dump of every sheet as backup context for Opus.
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(p, data_only=True, read_only=True)
+    except Exception as e:                             # noqa: BLE001
+        material.errors.append(f"could not open xlsx: {e}")
+        return material
+
+    try:
+        lines: list[str] = []
+        for sn in wb.sheetnames:
+            ws = wb[sn]
+            lines.append(f"\n## Sheet: {sn}")
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c).strip() if c is not None else "" for c in row]
+                if any(c for c in cells):
+                    lines.append(" | ".join(cells))
+        material.body_text = "\n".join(lines).strip()
+        # Prepend the KPI snapshot so it's the first thing Opus reads.
+        kpi_block = render_kpis_for_prompt(snap)
+        if kpi_block:
+            material.body_text = kpi_block + "\n\n" + material.body_text
+        material.meta["sheets"] = wb.sheetnames
+    except Exception as e:                             # noqa: BLE001
+        material.errors.append(f"xlsx_extraction_error: {e}")
+    return material
+
+
+# -----------------------------------------------------------------------------
 # Dispatcher
 # -----------------------------------------------------------------------------
-def ingest_file(file_path: str, use_cache: bool = True) -> RawCompanyMaterial:
+def ingest_file(file_path: str) -> RawCompanyMaterial:
     """Resolve company from filename, then route by extension to the right path."""
     rec = match_file_to_company(file_path)
     if rec is None:
@@ -520,19 +532,21 @@ def ingest_file(file_path: str, use_cache: bool = True) -> RawCompanyMaterial:
     ext = Path(file_path).suffix.lower()
     print(f"   • {rec.canonical_name} ({Path(file_path).name})")
     if ext in _PDF_EXTS:
-        return ingest_pdf(file_path, rec, use_cache=use_cache)
+        return ingest_pdf(file_path, rec)
     if ext in _PPTX_EXTS:
         return ingest_pptx(file_path, rec)
+    if ext in _XLSX_EXTS:
+        return ingest_xlsx(file_path, rec)
 
     m = RawCompanyMaterial(
         canonical_name=rec.canonical_name, category=rec.category,
         source_file=str(file_path), source_kind="unknown", static=rec.display_dict(),
     )
-    m.errors.append(f"Unsupported file type: {ext} (expected .pdf or .pptx)")
+    m.errors.append(f"Unsupported file type: {ext} (expected .pdf, .pptx, or .xlsx)")
     return m
 
 
-def ingest_portfolio(file_paths: list[str], use_cache: bool = True) -> list[RawCompanyMaterial]:
+def ingest_portfolio(file_paths: list[str]) -> list[RawCompanyMaterial]:
     """Ingest all monthly reports for this cycle into uniform material.
 
     Surfaces both hard errors and soft warnings, and reports which registry
@@ -541,7 +555,7 @@ def ingest_portfolio(file_paths: list[str], use_cache: bool = True) -> list[RawC
     print("📥 INGESTION")
     out: list[RawCompanyMaterial] = []
     for fp in file_paths:
-        out.append(ingest_file(fp, use_cache=use_cache))
+        out.append(ingest_file(fp))
 
     # Coverage check: which registry companies got no file this cycle?
     from sevend_registry import REGISTRY
@@ -567,16 +581,14 @@ def ingest_portfolio(file_paths: list[str], use_cache: bool = True) -> list[RawC
 if __name__ == "__main__":
     import sys
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    no_cache = "--no-cache" in sys.argv
     files = args or [
         "input/RapidImages_mars.pptx",
         "input/Kvaser_Q1.pptx",
     ]
-    results = ingest_portfolio(files, use_cache=not no_cache)
+    results = ingest_portfolio(files)
     print("\n--- SUMMARY ---")
     for m in results:
         dr = "yes" if m.deep_read else "no"
-        cache = " (cache)" if m.meta.get("cache_hit") else ""
         print(f"  {m.canonical_name:18s} kind={m.source_kind:11s} "
               f"text={len(m.body_text):6d}  deep_read={dr}  "
-              f"warn={len(m.warnings)} err={len(m.errors)}{cache}")
+              f"warn={len(m.warnings)} err={len(m.errors)}")

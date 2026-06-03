@@ -123,6 +123,29 @@ def _rag_fill(cell, rag: RAG) -> None:
     _set_cell_fill(cell, RAG_HEX.get(rag))
 
 
+def _covenant_fill(covenant_text: str) -> str:
+    """Decide the covenant cell colour from its text.
+
+    Red only for an actual breach/problem; amber for an in-progress discussion;
+    otherwise neutral grey. We never paint a 'No breach' covenant cell red just
+    because financing elsewhere is stressed.
+    """
+    t = (covenant_text or "").strip().lower()
+    if not t or t in ("n/a", "na", "none"):
+        return NA_HEX
+    # Explicit "no breach / no issue" -> neutral, even if verbose.
+    if t.startswith("no") or "no breach" in t or "no covenant" in t:
+        return NA_HEX
+    # Active breach language -> red.
+    if any(k in t for k in ("breach", "default", "broken", "not meet", "won't meet", "fail")):
+        return RAG_HEX[RAG.RED]
+    # Ongoing dialogue/waiver -> amber.
+    if any(k in t for k in ("discussion", "dialogue", "waiver", "negotiat", "talks", "renegotiat")):
+        return RAG_HEX[RAG.AMBER]
+    # Anything else mentioned but unclear -> amber (worth a look), not red.
+    return RAG_HEX[RAG.AMBER]
+
+
 # -----------------------------------------------------------------------------
 # Heatmap injection
 # -----------------------------------------------------------------------------
@@ -143,25 +166,57 @@ def _index_rows_by_name(table) -> dict[str, int]:
     return idx
 
 
+def _short_label(text: str, max_words: int = 3, max_chars: int = 22) -> str:
+    """Safety net: cap heatmap cell text to a short label even if the model
+    returns something too long. Keeps the prompt's intent enforceable at render
+    time. Full text always survives in the speaker-notes reasoning.
+
+    This is a last-resort guard -- the prompt asks the model for short labels, so
+    it should rarely fire. When it does, we cut at a word boundary and drop a
+    dangling connector ('but', 'still', 'and'...) so the result reads cleanly.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    words = t.split()
+    truncated = False
+    if len(words) > max_words:
+        words = words[:max_words]
+        truncated = True
+    # Drop a trailing connector left dangling by the cut.
+    connectors = {"but", "still", "and", "or", "with", "to", "of", "the", "a", "by", "for"}
+    while words and words[-1].lower().strip(",.;:") in connectors:
+        words.pop()
+        truncated = True
+    t = " ".join(words).rstrip(" ,;:.")
+    if len(t) > max_chars:
+        # Cut to the last whole word within the char budget rather than mid-word.
+        cut = t[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:.")
+        t = cut or t[:max_chars].rstrip(" ,;:.")
+        truncated = True
+    return (t + "…") if truncated and t else t
+
+
 def _inject_company_row(table, row: int, c: CompanyFacts) -> None:
     fin = c.financing
 
-    # Text + RAG fills for the judgement columns.
-    _set_cell_text(table.cell(row, COL_THESIS), c.investment_thesis.effective_text)
+    # Text + RAG fills for the judgement columns. Labels are capped short so they
+    # always fit the narrow cells; the full nuance lives in the speaker notes.
+    _set_cell_text(table.cell(row, COL_THESIS), _short_label(c.investment_thesis.effective_text))
     _rag_fill(table.cell(row, COL_THESIS), c.investment_thesis.effective_rag)
 
-    _set_cell_text(table.cell(row, COL_PERFORMANCE), c.performance.effective_text)
+    _set_cell_text(table.cell(row, COL_PERFORMANCE), _short_label(c.performance.effective_text))
     _rag_fill(table.cell(row, COL_PERFORMANCE), c.performance.effective_rag)
 
-    _set_cell_text(table.cell(row, COL_FIN_SUMMARY), fin.summary.effective_text)
+    _set_cell_text(table.cell(row, COL_FIN_SUMMARY), _short_label(fin.summary.effective_text))
     _rag_fill(table.cell(row, COL_FIN_SUMMARY), fin.summary.effective_rag)
 
     # Covenant + financing detail columns (already gated to n/a upstream).
-    _set_cell_text(table.cell(row, COL_COVENANT), fin.covenant_issue)
-    # Colour the covenant cell: red if there's an active issue, else neutral grey
-    # (never leave the template's original green/red showing).
-    _set_cell_fill(table.cell(row, COL_COVENANT),
-                   RAG_HEX[RAG.RED] if fin.has_active_issue else NA_HEX)
+    _set_cell_text(table.cell(row, COL_COVENANT), _short_label(fin.covenant_issue))
+    # Colour the covenant cell by what the covenant text ACTUALLY says -- not the
+    # broad financing-issue flag. A runway/liquidity concern can make financing
+    # red while the covenant itself is fine; those must not be conflated.
+    _set_cell_fill(table.cell(row, COL_COVENANT), _covenant_fill(fin.covenant_issue))
     _set_cell_text(table.cell(row, COL_AMOUNT), fin.amount)
     _set_cell_text(table.cell(row, COL_TYPE), fin.type)
     _set_cell_text(table.cell(row, COL_7D_AMOUNT), fin.sevend_amount)
@@ -234,42 +289,311 @@ def _neutralise_row(table, row: int) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Update slides (3-6): text injection
+# Update slides (3-6): position-based slot injection
 # -----------------------------------------------------------------------------
-def _company_update_text(c: CompanyFacts) -> str:
-    """Compose the update-block text for one company (MVP: consolidated text)."""
-    def block(title, b):
-        head = f"{title} [{b.effective_rag.value}]"
-        bul = "\n".join(f"  • {x}" for x in b.effective_bullets) or "  • (no points)"
-        return f"{head}\n{bul}"
-    parts = [
-        block("Operational update", c.operational),
-        block("Financial performance", c.financial),
-        block("Three-year value creation", c.three_year),
+# Each update slide has up to two company columns (left ~x<13in, right >=13in).
+# Within a column, four content boxes stack by vertical position:
+#   row 0 ~y5.0  Operational update
+#   row 1 ~y7.2  Financial performance
+#   row 2 ~y9.3  Three-year value creation
+#   row 3 ~y11.4 7D focus and contribution
+# Company identity in the template is a logo/position, not reliable text, so we
+# assign companies to slots IN ORDER (same category order as the heatmap) and
+# write the company name into the first block as a header so each is labelled.
+
+_ROW_Y = [5.0, 7.2, 9.3, 11.4]   # approximate top (inches) of each content row
+_ROW_TOL = 1.0                    # vertical tolerance for matching a box to a row
+_COL_SPLIT_IN = 13.0              # x < split = left column, else right
+
+
+def _emu_in(v) -> float:
+    from pptx.util import Emu
+    return Emu(v).inches if v is not None else -1.0
+
+
+def _collect_update_slots(slide):
+    """Return {(col, row): content_shape} for the long-text content boxes, plus
+    {(col, row): ellipse_shape} for the status balls, keyed by column (0=left,
+    1=right) and row (0-3). Matching is purely positional, so it is robust to the
+    differing shape order across slides 3-6."""
+    content: dict[tuple[int, int], object] = {}
+    ellipses: list[tuple[float, float, object]] = []
+    for shape in slide.shapes:
+        x, y = _emu_in(shape.left), _emu_in(shape.top)
+        if x < 0 or y < 0:
+            continue
+        col = 0 if x < _COL_SPLIT_IN else 1
+        if "Ellips" in shape.name:
+            ellipses.append((x, y, shape))
+            continue
+        if shape.has_text_frame and "Rektangel" in shape.name:
+            t = shape.text_frame.text.strip()
+            if len(t) > 40:  # a content box (carries real update prose)
+                for ri, ry in enumerate(_ROW_Y):
+                    if abs(y - ry) <= _ROW_TOL:
+                        content[(col, ri)] = shape
+                        break
+    return content, ellipses
+
+
+def _nearest_ellipse(ellipses, target_x: float, target_y: float):
+    """Find the status ellipse closest to a content row (the RAG ball)."""
+    best, best_d = None, 1e9
+    for x, y, sh in ellipses:
+        d = abs(y - target_y) + abs(x - target_x) * 0.3
+        if d < best_d:
+            best_d, best = d, sh
+    return best
+
+
+def _set_shape_text(shape, text: str) -> None:
+    """Overwrite a shape's text, preserving the first run's formatting."""
+    tf = shape.text_frame
+    if tf.paragraphs and tf.paragraphs[0].runs:
+        tf.paragraphs[0].runs[0].text = text
+        for extra in tf.paragraphs[0].runs[1:]:
+            extra._r.getparent().remove(extra._r)
+        for extra_p in tf.paragraphs[1:]:
+            extra_p._p.getparent().remove(extra_p._p)
+    else:
+        tf.text = text
+
+
+def _trim_bullet(text: str, max_words: int = 20, max_chars: int = 120) -> str:
+    """Cap a single bullet so it can't blow out the box. The caps match the
+    template's actual readable density (~4 bullets per block, ~2 lines each).
+
+    A semicolon-packed multi-fact bullet still gets cut to the first fact --
+    the prompt asks for one fact per bullet and packing is the model's bug,
+    not legitimate length.
+    """
+    t = (text or "").strip()
+    if not t:
+        return t
+    cut = False
+    # If the model crammed multiple facts with ';', keep just the first.
+    if ";" in t:
+        t = t.split(";", 1)[0].strip()
+        cut = True
+    words = t.split()
+    if len(words) > max_words:
+        words = words[:max_words]; cut = True
+    t = " ".join(words)
+    if len(t) > max_chars:
+        t = t[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:."); cut = True
+    return (t.rstrip(" ,;:.") + "…") if cut else t
+
+
+def _set_bullets(shape, lines: list[str], header: str = "", max_bullets: int = 3) -> None:
+    """Fill a content box with an optional bold header line then bullet lines.
+
+    Layout protection (belt + suspenders):
+      1. Hard-caps bullet count + length via `_trim_bullet`.
+      2. Fixes body bullets at 16pt (smaller than the template's ~18pt, gives
+         ~10% more vertical room per box for the realistic case).
+      3. Enables PowerPoint's native shrink-on-overflow auto-fit, so anything
+         that STILL won't fit at 16pt scales down automatically rather than
+         bleeding into the block below.
+    """
+    from pptx.util import Pt
+    from pptx.enum.text import MSO_AUTO_SIZE
+
+    # Safety net: cap count and trim each bullet (prompt asks for this too).
+    capped = [_trim_bullet(x) for x in lines if x][:max_bullets]
+    tf = shape.text_frame
+    # Capture formatting from the existing first run before clearing.
+    base_run = tf.paragraphs[0].runs[0] if (tf.paragraphs and tf.paragraphs[0].runs) else None
+    font_name = base_run.font.name if base_run else "Helvetica Neue"
+    font_rgb = None
+    if base_run is not None:
+        try:
+            if base_run.font.color and base_run.font.color.type is not None:
+                font_rgb = base_run.font.color.rgb
+        except Exception:                              # noqa: BLE001
+            font_rgb = None
+    if font_rgb is None:
+        font_rgb = RGBColor.from_string("293447")      # template dark navy fallback
+
+    # Fixed body size (slightly smaller than template default for room).
+    body_size = Pt(16)
+    header_size = Pt(17)  # mild hierarchy without dominating
+
+    tf.word_wrap = True
+    # Auto-fit: shrink text to fit if 16pt still overflows. Native PowerPoint
+    # behavior; renders identically in PowerPoint and downstream viewers.
+    try:
+        tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_SHAPE_HEIGHT  # 'Shrink text on overflow' equivalent
+    except Exception:                                  # noqa: BLE001
+        pass
+
+    tf.clear()
+    body_lines = ([f"{header}"] if header else []) + [f"• {x}" for x in capped]
+    if not body_lines:
+        body_lines = ["• (no update this cycle)"]
+    for i, line in enumerate(body_lines):
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+        try:
+            from pptx.enum.text import PP_ALIGN
+            p.alignment = PP_ALIGN.LEFT
+        except Exception:                              # noqa: BLE001
+            pass
+        run = p.add_run()
+        run.text = line
+        if font_name:
+            run.font.name = font_name
+        # Header line gets the slightly larger size; bullets get the body size.
+        is_header_line = bool(header) and i == 0
+        run.font.size = header_size if is_header_line else body_size
+        run.font.color.rgb = font_rgb
+        if is_header_line:
+            run.font.bold = True
+
+
+def _fill_company_column(content, ellipses, col: int, c: CompanyFacts) -> None:
+    """Fill one company column (operational/financial/three-year/7D focus + RAG)."""
+    blocks = [
+        (0, c.operational, f"{c.canonical_name} — Operational"),
+        (1, c.financial, "Financial performance"),
+        (2, c.three_year, "Three-year value creation"),
     ]
-    if c.sevend_focus:
-        parts.append("7D focus and contribution\n" + "\n".join(f"  • {x}" for x in c.sevend_focus))
-    return "\n\n".join(parts)
+    for row, block, header in blocks:
+        shape = content.get((col, row))
+        if shape is None:
+            continue
+        _set_bullets(shape, block.effective_bullets, header=header)
+        # Recolour the nearest status ellipse to the block's RAG.
+        x = _emu_in(shape.left)
+        ell = _nearest_ellipse(ellipses, target_x=(4.3 if col == 0 else 16.2),
+                               target_y=_ROW_Y[row])
+        if ell is not None:
+            _set_cell_fill_shape(ell, RAG_HEX[block.effective_rag])
+    # 7D focus (row 3, no RAG ball).
+    focus_shape = content.get((col, 3))
+    if focus_shape is not None:
+        _set_bullets(focus_shape, c.sevend_focus, header="7D focus and contribution")
+
+
+def _set_cell_fill_shape(shape, hex_color: str) -> None:
+    """Solid-fill an autoshape (status ellipse) reliably."""
+    from pptx.oxml.ns import qn
+    spPr = shape._element.spPr
+    for tag in ("a:solidFill", "a:noFill", "a:gradFill", "a:blipFill", "a:pattFill"):
+        for el in spPr.findall(qn(tag)):
+            spPr.remove(el)
+    shape.fill.solid()
+    shape.fill.fore_color.rgb = RGBColor.from_string(hex_color)
+
+
+def render_update_slides(prs: Presentation, report: PortfolioReport) -> None:
+    """Fill update slides (3-6), pinning each company to ITS slot so it always
+    sits under its own logo (see UPDATE_SLOT_MAP in the registry).
+
+    A pinned company that did not report this cycle has its slot blanked (stale
+    template text cleared) rather than backfilled by someone else -- a logo must
+    never sit above the wrong company's update.
+    """
+    from sevend_registry import UPDATE_SLOT_MAP
+
+    by_name = {c.canonical_name.lower(): c for c in report.companies}
+    unplaced = []
+
+    for (si, col), company_name in UPDATE_SLOT_MAP.items():
+        if si >= len(prs.slides):
+            continue
+        content, ellipses = _collect_update_slots(prs.slides[si])
+        c = by_name.get(company_name.lower())
+        if c is not None and c.has_report_this_cycle and not c.flags:
+            _fill_company_column(content, ellipses, col, c)
+        else:
+            # Pinned company absent/failed this cycle -> blank the slot cleanly.
+            _blank_company_column(content, ellipses, col, company_name)
+
+    # Surface any reporting company that has no pinned slot (portfolio changed
+    # but the slot map wasn't updated).
+    pinned = {n.lower() for n in UPDATE_SLOT_MAP.values()}
+    for c in report.companies:
+        if c.has_report_this_cycle and not c.flags and c.canonical_name.lower() not in pinned:
+            unplaced.append(c.canonical_name)
+    if unplaced:
+        print(f"   ⚠️ Reporting companies with no update-slide slot (add to "
+              f"UPDATE_SLOT_MAP): {', '.join(unplaced)}")
+
+
+def _blank_company_column(content, ellipses, col: int, company_name: str) -> None:
+    """Clear a slot whose pinned company didn't report, so no stale template
+    text or wrong-company content remains under its logo."""
+    blocks = [
+        (0, f"{company_name} — Operational"),
+        (1, "Financial performance"),
+        (2, "Three-year value creation"),
+        (3, "7D focus and contribution"),
+    ]
+    for row, header in blocks:
+        shape = content.get((col, row))
+        if shape is None:
+            continue
+        _set_bullets(shape, ["No report this cycle"], header=header)
+        if row < 3:
+            ell = _nearest_ellipse(ellipses, target_x=(4.3 if col == 0 else 16.2),
+                                   target_y=_ROW_Y[row])
+            if ell is not None:
+                _set_cell_fill_shape(ell, NA_HEX)
 
 
 # -----------------------------------------------------------------------------
 # Public entry point
 # -----------------------------------------------------------------------------
+def _resolve_template(template_path: str) -> str:
+    """Find the template whether the project is flat or nested.
+
+    The CANONICAL home is assets/7d_template.pptx, committed to the repo and
+    located relative to this file -- so a fresh `git clone`/`pull` on any machine
+    finds it with zero configuration, no matter what folder you run from.
+
+    Falls back to other sensible spots (flat layout, template/ subfolder, the
+    explicit path given) so it keeps working across layouts. Raises a clear error
+    listing everywhere it looked if nothing is found.
+    """
+    from pathlib import Path as _P
+    here = _P(__file__).resolve().parent
+    candidates = [
+        here / "assets" / "7d_template.pptx",      # canonical, committed home
+        _P(template_path),                          # explicit path as given
+        here / template_path,
+        here / _P(template_path).name,
+        here / _P(template_path).name,
+        here / "template" / _P(template_path).name,
+        here / "7d_template.pptx",                  # flat layout
+        here / "Monthly_Portfolio_Company_report_Template.pptx",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    looked = "\n      ".join(str(c) for c in candidates)
+    raise FileNotFoundError(
+        f"Could not find the 7D template .pptx. Looked in:\n      {looked}\n"
+        f"   The template should live at assets/7d_template.pptx (committed to the repo). "
+        f"Or pass a path with --template."
+    )
+
+
 def render_report(report: PortfolioReport, template_path: str, out_path: str) -> str:
-    """Render the full deck from the template. Returns the output path."""
+    """Render the deck from the template. Returns the output path.
+
+    NOTE: The heatmap (slide 2) is INTENTIONALLY NOT rendered. By 7D's choice,
+    the heatmap is a static reference page that 7D maintains by hand in the
+    template. The engine only fills the per-company update slides (3-6), where
+    monthly content actually changes. `render_heatmap` remains in this module
+    in case the policy is ever reversed -- it just isn't called.
+    """
+    template_path = _resolve_template(template_path)
     prs = Presentation(template_path)
 
-    missing = render_heatmap(prs, report)
-
-    # Title slide date label, if present (slide 1).
-    # (Left as-is for MVP; 7D's template title is generic.)
+    # render_heatmap(prs, report)   # disabled by 7D policy -- heatmap is manual
+    render_update_slides(prs, report)
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     prs.save(out_path)
-
-    if missing:
-        print(f"   ⚠️ Companies not found as rows in the template heatmap: {', '.join(missing)}")
-        print(f"      (Add a matching row to the template, or align registry names.)")
     return out_path
 
 
@@ -305,7 +629,7 @@ if __name__ == "__main__":
         ],
     )
 
-    out = render_report(report, "template/7d_template.pptx", "output/7d_report_April_2026.pptx")
+    out = render_report(report, "assets/7d_template.pptx", "output/7d_report_April_2026.pptx")
     print(f"Rendered: {out}")
 
     # Verify by reading back the injected cells.

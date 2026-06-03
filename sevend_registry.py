@@ -85,7 +85,12 @@ REGISTRY: list[CompanyRecord] = [
         lead="DA", support="SGS",
         investment_thesis="Delayed",
         exit_timing="2029",
-        aliases=["cloud", "compute", "cloudcompute", "cloud_compute"],
+        aliases=[
+            "cloud", "compute", "cloudcompute", "cloud_compute",
+            # WinCore AB (org 556518-9130) is the underlying entity reporting
+            # under the Cloud & Compute portfolio company.
+            "wincore", "win_core", "balansrapport",
+        ],
     ),
     CompanyRecord(
         canonical_name="Ocean Collective",
@@ -109,7 +114,13 @@ REGISTRY: list[CompanyRecord] = [
         lead="SGS", support="DA",
         investment_thesis="OK",
         exit_timing="2026/2027",
-        aliases=["airolit"],
+        aliases=[
+            "airolit",
+            # "Intelligent Aerial" is the long-form name of the underlying entity.
+            # NOTE: do NOT add a bare "ia" alias -- it substring-matches "Financial",
+            # "Asia", "Official" and would misroute unrelated files.
+            "intelligent_aerial", "intelligentaerial", "ia_data",
+        ],
     ),
     CompanyRecord(
         canonical_name="Inretrn",
@@ -119,22 +130,8 @@ REGISTRY: list[CompanyRecord] = [
         exit_timing="2028",
         aliases=["inretrn", "inretrn", "mr_", "mr-", "inretr"],
     ),
-    CompanyRecord(
-        canonical_name="Incipientus",
-        category="Non-core holdings",
-        lead="PS", support="n/a",
-        investment_thesis="OK",
-        exit_timing="2027",
-        aliases=["incipientus"],
-    ),
-    CompanyRecord(
-        canonical_name="Klint",
-        category="Non-core holdings",
-        lead="PS", support="n/a",
-        investment_thesis="OK",
-        exit_timing="2027",
-        aliases=["klint"],
-    ),
+    # Incipientus and Klint removed from active portfolio (May 2026).
+    # If they return, restore their CompanyRecord entries here.
     CompanyRecord(
         canonical_name="Qamcom",
         category="Under divestment",
@@ -165,6 +162,32 @@ REGISTRY: list[CompanyRecord] = [
 # Use this when a filename has no usable tokens. Highest matching priority.
 FILE_MAP: dict[str, str] = {
     # "mr_03-2026": "Inretrn",
+}
+
+
+# -----------------------------------------------------------------------------
+# UPDATE-SLIDE SLOT PINNING
+# -----------------------------------------------------------------------------
+# The template's update slides (3-6) have a fixed company LOGO baked into each
+# slot. To keep every company under its OWN logo, we pin which company belongs
+# in each (slide_index, column) slot. slide_index is 0-based (slide 3 = index 2);
+# column 0 = left, 1 = right. This mirrors how 7D designed the template.
+#
+# A company whose slot is pinned here is always rendered into that slot. A slot
+# whose pinned company did NOT report this cycle is blanked (its stale template
+# text removed) rather than backfilled by another company -- so a logo never sits
+# above the wrong company's update.
+#
+# 7D maintains this map alongside the registry when the portfolio or the template
+# layout changes.
+UPDATE_SLOT_MAP: dict[tuple[int, int], str] = {
+    (2, 0): "Kvaser",            # slide 3 left
+    (2, 1): "Rapid Images",      # slide 3 right
+    (3, 0): "Cloud & Compute",   # slide 4 left
+    (3, 1): "Acre",              # slide 4 right
+    (4, 0): "Ocean Collective",  # slide 5 left
+    (4, 1): "Airolit",           # slide 5 right
+    (5, 0): "Inretrn",           # slide 6 left
 }
 
 

@@ -59,7 +59,9 @@ _load_env()
 
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-opus-4-7")  # Opus 4.7, reasoning
 _MAX_TOKENS = 4096
-_TEMPERATURE = 0.0
+# NOTE: Opus 4.7 rejects the `temperature` parameter ("deprecated for this
+# model"), so we do not pass it. The model is deterministic enough for this
+# schema-bound extraction without it.
 
 
 def _client() -> anthropic.Anthropic:
@@ -79,7 +81,7 @@ _OUTPUT_SHAPE = """{
   "performance":       {"proposed_rag": "green|amber|red", "proposed_text": "short cell text", "reasoning": "why"},
   "financing": {
     "summary": {"proposed_rag": "green|amber|red", "proposed_text": "short cell text", "reasoning": "why"},
-    "covenant_issue": "No | Yes, breach Q1 | Discussion with bank | ...",
+    "covenant_issue": "No | Yes, breach | In discussion | n/a  (max 3 words)",
     "has_active_issue": true|false,
     "amount": "MSEK or n/a", "type": "Defend or n/a", "sevend_amount": "MSEK or n/a",
     "timing": "Q2'26 or n/a", "sevend_rescue_amount": "MSEK or n/a"
@@ -109,9 +111,20 @@ Rules:
   reasoning grounded in THIS report's figures or statements. Never assert a colour without a reason.
 - Ground every claim in the report. Do not invent numbers, customers, or events. If something is not
   in the report, do not assert it.
-- proposed_text is the short heatmap cell label (e.g. "Improving", "Weak trading", "Strong Q1",
-  "Mixed / turnaround"). Keep it to a few words.
-- bullets are 3-5 short, owner-relevant points per update block. Concrete over generic.
+- proposed_text is a SHORT heatmap cell label: MAXIMUM 3 WORDS, ideally 1-2. It must fit a
+  narrow table cell. Use a crisp label, never a sentence. Good: "Improving", "Weak trading",
+  "Strong Q1", "Above budget", "Turnaround", "Runway risk". Bad (too long): "Above budget, but
+  flattered by upsell", "Transformation on track but IKEA hit". Put the nuance in `reasoning`,
+  not here -- the reasoning is preserved in full; the cell is just the label.
+- covenant_issue is ALSO a short standard value, max 3 words: "No", "Yes, breach", "In
+  discussion", "Waiver sought", or "n/a". Never a sentence like "No covenant breach reported".
+- bullets: 3 per update block (the template's norm). Each bullet is a substantive
+  point of up to ~18 words, MAX 20. Include concrete figures and qualifiers where the report
+  supports it (e.g. "Q1 EBITDA -0.7 MSEK, beats budget by +0.4, but FX drags other income").
+  Single fact per bullet -- do not chain unrelated facts with semicolons. Concrete over generic.
+- sevend_focus: 3-4 items, same ~18-word/20-word maximum. These are owner ACTIONS, not
+  observations -- "Continue to support CEO in turnaround", "Evaluate add-on acquisitions",
+  "Map out long-term strategic alternatives for divestment".
 - FINANCING: set has_active_issue=true ONLY if the report shows a real financing problem or event
   (covenant breach/discussion, refinancing need, capital raise in play, runway concern). If false,
   leave amount/type/sevend_amount/timing/sevend_rescue_amount as "n/a".
@@ -119,7 +132,8 @@ Rules:
 
 
 def _build_prompt(material) -> str:
-    """Assemble the user prompt from the transcription + custodial deep-read notes."""
+    """Assemble the user prompt from the transcription, deep-read notes, and any
+    deterministic KPI snapshots from xlsx ingestion."""
     deep = ""
     if material.deep_read and "_raw" not in material.deep_read:
         deep = (
@@ -130,6 +144,34 @@ def _build_prompt(material) -> str:
     elif material.deep_read and "_raw" in material.deep_read:
         deep = "\n\nDEEP-READ NOTES (unstructured):\n" + str(material.deep_read.get("_raw", ""))[:2000]
 
+    # Structured KPI block: when ingestion ran a deterministic extractor on an
+    # xlsx, those numbers are GROUND TRUTH. Surface them first so they anchor
+    # the assessment rather than competing with raw cells in body_text.
+    kpi_block = ""
+    if getattr(material, "kpis", None):
+        kpi_block = (
+            "\n\nGROUND-TRUTH KPI SNAPSHOTS (deterministic extraction from spreadsheet data; "
+            "these numbers are AUTHORITATIVE -- if anything in the body text conflicts, trust "
+            "these). Quote these figures in bullets and the financing summary where relevant:\n"
+        )
+        for k in material.kpis:
+            ents = k.get("entities") or {}
+            ent_summary = ""
+            if ents:
+                ent_summary = "\n  Per-entity: " + "; ".join(
+                    f"{name}: rev={v.get('revenue','-')}, ebitda={v.get('ebitda', v.get('ebitda_pre_eo','-'))}, cash={v.get('cash','-')}"
+                    for name, v in ents.items()
+                )
+            kpi_block += (
+                f"- file={_Path(k.get('source_file','')).name} unit={k.get('unit','KSEK')} "
+                f"revenue={k.get('revenue')} gross_profit={k.get('gross_profit')} "
+                f"gross_margin%={k.get('gross_margin_pct')} ebitda_pre_eo={k.get('ebitda_pre_eo')} "
+                f"ebitda={k.get('ebitda')} ebitda_margin%={k.get('ebitda_margin_pct')} "
+                f"cash={k.get('cash')} long_term_debt={k.get('long_term_debt')} "
+                f"short_term_debt={k.get('short_term_debt')} net_debt={k.get('net_debt')}"
+                f"{ent_summary}\n"
+            )
+
     static = material.static or {}
     thesis_baseline = static.get("investment_thesis", "")
     baseline_line = (
@@ -138,8 +180,14 @@ def _build_prompt(material) -> str:
         if thesis_baseline else ""
     )
 
+    # Source breakdown for multi-file bundles.
+    sources_line = ""
+    if getattr(material, "sources", None) and len(material.sources) > 1:
+        names = ", ".join(_Path(s).name for s in material.sources)
+        sources_line = f"\nSOURCES (multiple files merged for this company): {names}"
+
     return f"""COMPANY: {material.canonical_name}  (7D category: {material.category})
-SOURCE: {material.source_kind}{baseline_line}
+SOURCE: {material.source_kind}{sources_line}{baseline_line}{kpi_block}
 
 --- BEGIN MONTHLY REPORT CONTENT ---
 {material.body_text}
@@ -266,7 +314,6 @@ def reason_company(material, client: Optional[anthropic.Anthropic] = None) -> Co
             resp = cli.messages.create(
                 model=CLAUDE_MODEL,
                 max_tokens=_MAX_TOKENS,
-                temperature=_TEMPERATURE,
                 system=_SYSTEM,
                 messages=[{"role": "user", "content": prompt + extra}],
             )

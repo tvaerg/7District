@@ -1,26 +1,29 @@
-# Secrets
-.env
-.env.*
-*.key
-secrets/
-credentials.json
+# =============================================================================
+# 7D Portfolio Aggregation Engine -- .gitignore
+# =============================================================================
 
-# Python
+# --- Secrets: NEVER commit ---------------------------------------------------
+.env
+*.env
+!.env.example          # keep the example template tracked
+
+# --- Confidential inputs: portfolio companies' monthly reports ---------------
+# These are sensitive financials and must not live in git. Keep them local.
+input/
+*.pdf
+# PPTX inputs are confidential too -- but we MUST keep the template (an asset,
+# not data). Ignore stray pptx, then force-track the committed template below.
+*.pptx
+!assets/7d_template.pptx
+
+# --- Generated output: regenerated every run, no need to track ---------------
+output/
+output/.gemini_cache/
+
+# --- Python cruft ------------------------------------------------------------
 __pycache__/
 *.pyc
+*.pyo
 .venv/
 venv/
-env/
-
-# Data och output
-*.pdf
-*.docx
-*.pptx
-data/
-output/
-uploads/
-
-# OS och editor
 .DS_Store
-.vscode/
-.idea/

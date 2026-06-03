@@ -19,7 +19,7 @@ are explicit.
 
 Usage:
     python sevend_pipeline.py *.pdf *.pptx --cycle "April 2026"
-    python sevend_pipeline.py "MR 03-2026.pdf" --cycle "March 2026" --no-cache
+    python sevend_pipeline.py "MR 03-2026.pdf" --cycle "March 2026"
 
 Env: GEMINI_API_KEY / GOOGLE_API_KEY (PDF ingest), ANTHROPIC_API_KEY (reasoning).
 """
@@ -27,7 +27,9 @@ Env: GEMINI_API_KEY / GOOGLE_API_KEY (PDF ingest), ANTHROPIC_API_KEY (reasoning)
 from __future__ import annotations
 
 import sys
+import re
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 from sevend_ingestion import ingest_portfolio, RawCompanyMaterial
@@ -46,17 +48,57 @@ def _placeholder_material(rec) -> RawCompanyMaterial:
     )
 
 
+def bundle_materials(materials: list[RawCompanyMaterial]) -> list[RawCompanyMaterial]:
+    """Merge multiple files for the SAME company into one bundle so reasoning
+    sees everything for that company in a single Opus call. KPIs and source
+    files accumulate; body_text is concatenated with file separators."""
+    by_name: dict[str, RawCompanyMaterial] = {}
+    for m in materials:
+        key = m.canonical_name.lower()
+        primary = by_name.get(key)
+        if primary is None:
+            # Initialise with this material; record it in `sources`.
+            m.sources = [m.source_file]
+            by_name[key] = m
+            continue
+        # Merge m into primary.
+        primary.sources.append(m.source_file)
+        if m.body_text:
+            sep = f"\n\n========== ADDITIONAL FILE: {Path(m.source_file).name} ({m.source_kind}) ==========\n\n"
+            primary.body_text = (primary.body_text + sep + m.body_text) if primary.body_text else m.body_text
+        if m.kpis:
+            primary.kpis.extend(m.kpis)
+        if m.deep_read and not primary.deep_read:
+            primary.deep_read = m.deep_read
+        primary.warnings.extend(m.warnings)
+        primary.errors.extend(m.errors)
+        # Record the mixed source kinds so reasoning prompt can mention them.
+        primary.meta.setdefault("source_kinds", [primary.source_kind])
+        if m.source_kind not in primary.meta["source_kinds"]:
+            primary.meta["source_kinds"].append(m.source_kind)
+    return list(by_name.values())
+
+
 def run_pipeline(files: list[str], cycle_label: str, ceo_update: str = "",
-                 use_cache: bool = True,
-                 template_path: str = "template/7d_template.pptx",
-                 out_path: str = "output/7d_portfolio_report.pptx") -> PortfolioReport:
+                 template_path: str = "assets/7d_template.pptx",
+                 out_path: str | None = None) -> PortfolioReport:
     print("=" * 70)
     print(f"7D PORTFOLIO AGGREGATION  |  cycle: {cycle_label}")
     print("=" * 70)
 
     # Stage 1: ingest.
-    materials = ingest_portfolio(files, use_cache=use_cache)
+    materials = ingest_portfolio(files)
     materials = [m for m in materials if m.canonical_name != "UNMATCHED"]
+
+    # Bundle: multiple files for the same company merge into ONE material so
+    # reasoning sees the whole picture (narrative + KPIs) in one Opus call.
+    materials = bundle_materials(materials)
+    bundled = [(m.canonical_name, len(m.sources)) for m in materials if len(m.sources) > 1]
+    if bundled:
+        print("\n   📎 Bundled multi-file companies:")
+        for nm, n in bundled:
+            print(f"      {nm}: {n} files merged")
+
     covered = {m.canonical_name for m in materials}
 
     # Add placeholders for uncovered registry companies so the heatmap is complete.
@@ -83,9 +125,13 @@ def run_pipeline(files: list[str], cycle_label: str, ceo_update: str = "",
         else:
             print(f"   • {m.canonical_name}...", end=" ", flush=True)
             cf = reason_company(m, client=client)
-            tag = "✅" if cf.has_report_this_cycle and not cf.flags else (
-                  "⚠️" if cf.flags else "✅")
-            print(f"{tag} {cf.performance.proposed_rag.value}/{cf.performance.proposed_text}")
+            if cf.flags:
+                # A company that HAD content but came back flagged means reasoning
+                # failed (API error, bad JSON, truncation) -- surface it loudly so
+                # a systemic failure is never mistaken for a genuine 'No report'.
+                print(f"❌ FAILED -- {cf.flags[0]}")
+            else:
+                print(f"✅ {cf.performance.proposed_rag.value}/{cf.performance.proposed_text}")
         facts.append(cf)
 
     # Order by 7D category for a tidy review file.
@@ -95,6 +141,12 @@ def run_pipeline(files: list[str], cycle_label: str, ceo_update: str = "",
     report = PortfolioReport(cycle_label=cycle_label, ceo_update=ceo_update, companies=facts)
 
     # Stage 3: render the deck directly from the template.
+    # If no explicit --out was given, auto-name with cycle label + timestamp so
+    # each monthly run is preserved rather than overwriting the last.
+    if out_path is None:
+        safe_cycle = re.sub(r"[^\w]+", "_", cycle_label).strip("_") or "report"
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = f"output/7d_portfolio_report_{safe_cycle}_{stamp}.pptx"
     print(f"\n📄 RENDER -> {out_path}")
     out = render_report(report, template_path, out_path)
     print("\n" + "=" * 70)
@@ -112,12 +164,13 @@ def main():
     ap.add_argument("files", nargs="+", help="Input report files (.pdf / .pptx)")
     ap.add_argument("--cycle", required=True, help="Cycle label, e.g. 'April 2026'")
     ap.add_argument("--ceo-update", default="", help="Optional CEO update line for the heatmap slide")
-    ap.add_argument("--no-cache", action="store_true", help="Bypass the Gemini output cache")
-    ap.add_argument("--template", default="template/7d_template.pptx", help="Path to 7D template .pptx")
-    ap.add_argument("--out", default="output/7d_portfolio_report.pptx", help="Output deck path")
+    ap.add_argument("--template", default="assets/7d_template.pptx", help="Path to 7D template .pptx")
+    ap.add_argument("--out", default=None,
+                    help="Output deck path. If omitted, auto-names with cycle + timestamp "
+                         "(e.g. output/7d_portfolio_report_April_2026_20260528_141503.pptx).")
     args = ap.parse_args()
     run_pipeline(args.files, cycle_label=args.cycle, ceo_update=args.ceo_update,
-                 use_cache=not args.no_cache, template_path=args.template, out_path=args.out)
+                 template_path=args.template, out_path=args.out)
 
 
 if __name__ == "__main__":
