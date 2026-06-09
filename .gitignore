@@ -2,28 +2,33 @@
 # 7D Portfolio Aggregation Engine -- .gitignore
 # =============================================================================
 
-# --- Secrets: NEVER commit ---------------------------------------------------
-.env
-*.env
-!.env.example          # keep the example template tracked
-
-# --- Confidential inputs: portfolio companies' monthly reports ---------------
-# These are sensitive financials and must not live in git. Keep them local.
-input/
+# Klientdata: pusha ALDRIG faktiska rapportfiler till Git.
+# Dessa innehåller bolagens finansiella siffror och hör inte hemma i repot.
 *.pdf
-# PPTX inputs are confidential too -- but we MUST keep the template (an asset,
-# not data). Ignore stray pptx, then force-track the committed template below.
 *.pptx
-!assets/7d_template.pptx
+*.ppt
+*.docx
+*.doc
+*.xlsx
+*.xls
+*.csv
 
-# --- Generated output: regenerated every run, no need to track ---------------
+# ...men behall PowerPoint-mallen som kravs for att kora motorn.
+# Negeringen aterinkluderar allt under assets/ aven om det matchar ovan.
+!assets/
+!assets/**
+
+# Genererade deckar och deras debug-dumpar (innehaller ocksa klientsiffror).
 output/
-output/.gemini_cache/
 
-# --- Python cruft ------------------------------------------------------------
+# Hemligheter och miljo.
+.env
+.env.*
+!.env.example
+
+# Python-skrap.
+venv/
+.venv/
 __pycache__/
 *.pyc
-*.pyo
-.venv/
-venv/
 .DS_Store
