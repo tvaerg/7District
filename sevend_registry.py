@@ -188,6 +188,9 @@ UPDATE_SLOT_MAP: dict[tuple[int, int], str] = {
     (4, 0): "Ocean Collective",  # slide 5 left
     (4, 1): "Airolit",           # slide 5 right
     (5, 0): "Inretrn",           # slide 6 left
+    (5, 1): "Visiba",            # slide 6 right (added when template extended)
+    (6, 0): "Devant",            # slide 7 left  (new slide added to template)
+    (6, 1): "Qamcom",            # slide 7 right (new slide added to template)
 }
 
 

@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import sys
 import re
+import json
+import copy
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +39,7 @@ from sevend_reasoning import reason_company, _no_report_placeholder, _client
 from sevend_schema import PortfolioReport
 from sevend_render import render_report
 from sevend_registry import REGISTRY, CATEGORY_ORDER
+from sevend_qa import run_qa
 
 
 def _placeholder_material(rec) -> RawCompanyMaterial:
@@ -46,6 +49,84 @@ def _placeholder_material(rec) -> RawCompanyMaterial:
         source_file="(no file this cycle)", source_kind="none",
         static=rec.display_dict(),
     )
+
+
+def _facts_to_jsonable(cf) -> dict:
+    """CompanyFacts -> plain dict for JSON dump. Pydantic's model_dump if it's a
+    pydantic model, otherwise asdict for dataclasses, with a fallback."""
+    try:
+        return cf.model_dump()           # pydantic v2
+    except AttributeError:
+        pass
+    try:
+        from dataclasses import asdict
+        return asdict(cf)
+    except Exception:                    # noqa: BLE001
+        return {k: v for k, v in cf.__dict__.items() if not k.startswith("_")}
+
+
+def _write_debug_dump(out_path: str, cycle_label: str, input_files: list[str],
+                       facts_post_qa: list, facts_pre_qa: dict,
+                       materials_by_name: dict) -> str:
+    """Write a debug JSON next to the rendered .pptx. Captures EVERYTHING a
+    reviewer needs to bug-hunt a run without opening the deck:
+      - run metadata (cycle, timestamp, input file list)
+      - per-company:
+          * sources (which files contributed)
+          * deterministic KPIs (xlsx ground truth, if any)
+          * facts_pre_qa  (what Opus reasoning produced)
+          * facts_post_qa (what gets rendered -- after QA mutated)
+          * qa_changes    (extracted from QA-fixed flags so they read easily)
+          * flags         (all warnings/errors on this company)
+    """
+    debug_path = re.sub(r"\.pptx$", "_debug.json", out_path)
+
+    companies_dump = []
+    for cf in facts_post_qa:
+        key = cf.canonical_name.lower()
+        pre = facts_pre_qa.get(key)
+        m = materials_by_name.get(key)
+
+        flags = list(cf.flags or [])
+        qa_changes = [f.replace("QA-fixed: ", "", 1) for f in flags if isinstance(f, str) and f.startswith("QA-fixed:")]
+        language_warnings = [f.replace("language: ", "", 1) for f in flags if isinstance(f, str) and f.startswith("language:")]
+        qa_errors = [f for f in flags if isinstance(f, str) and (f.startswith("QA error") or f.startswith("QA:"))]
+        other_flags = [f for f in flags if isinstance(f, str)
+                       and not f.startswith("QA-fixed:")
+                       and not f.startswith("language:")
+                       and not f.startswith("QA error")
+                       and not f.startswith("QA:")]
+
+        entry = {
+            "canonical_name": cf.canonical_name,
+            "category": cf.category,
+            "has_report_this_cycle": cf.has_report_this_cycle,
+            "sources": list(getattr(m, "sources", [])) if m else [],
+            "source_kinds": (m.meta.get("source_kinds") if m else None) or ([m.source_kind] if m else []),
+            "kpis": list(getattr(m, "kpis", [])) if m else [],
+            "facts_pre_qa":  _facts_to_jsonable(pre) if pre is not None else None,
+            "facts_post_qa": _facts_to_jsonable(cf),
+            "qa_changes": qa_changes,
+            "language_warnings": language_warnings,
+            "qa_errors": qa_errors,
+            "other_flags": other_flags,
+        }
+        companies_dump.append(entry)
+
+    payload = {
+        "cycle_label": cycle_label,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "input_files": [str(f) for f in input_files],
+        "rendered_pptx": str(out_path),
+        "companies": companies_dump,
+    }
+
+    Path(debug_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(debug_path).write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    return debug_path
 
 
 def bundle_materials(materials: list[RawCompanyMaterial]) -> list[RawCompanyMaterial]:
@@ -138,6 +219,14 @@ def run_pipeline(files: list[str], cycle_label: str, ceo_update: str = "",
     rank = {c: i for i, c in enumerate(CATEGORY_ORDER)}
     facts.sort(key=lambda c: rank.get(c.category, 99))
 
+    # Stage 2.5: QA. Language scrub + Opus hallucination check against source.
+    # See sevend_qa for what runs and why. QA mutates facts in place; failures
+    # do not block render -- they flag the affected company. We snapshot the
+    # facts BEFORE QA so the debug dump can show what QA changed.
+    facts_pre_qa = {c.canonical_name.lower(): copy.deepcopy(c) for c in facts}
+    materials_by_name = {m.canonical_name.lower(): m for m in materials}
+    run_qa(facts, materials_by_name, client)
+
     report = PortfolioReport(cycle_label=cycle_label, ceo_update=ceo_update, companies=facts)
 
     # Stage 3: render the deck directly from the template.
@@ -149,12 +238,32 @@ def run_pipeline(files: list[str], cycle_label: str, ceo_update: str = "",
         out_path = f"output/7d_portfolio_report_{safe_cycle}_{stamp}.pptx"
     print(f"\n📄 RENDER -> {out_path}")
     out = render_report(report, template_path, out_path)
+
+    # Debug dump alongside the .pptx so the run is fully traceable.
+    debug_path = _write_debug_dump(out_path, cycle_label, files, facts, facts_pre_qa, materials_by_name)
+    print(f"📋 DEBUG  -> {debug_path}")
     print("\n" + "=" * 70)
     print(f"✅ Wrote {out}")
     print("   Review and edit the .pptx directly in PowerPoint if needed.")
-    flagged = [c.canonical_name for c in facts if c.flags and c.has_report_this_cycle]
-    if flagged:
-        print(f"   ⚠️ Flagged for attention (see heatmap speaker notes): {', '.join(flagged)}")
+    # Two signal classes, distinct concerns:
+    # - QA-fixed: informational, the engine corrected something via the QA pass.
+    # - Other flags: real issues (language warnings, QA errors, reasoning failures).
+    qa_fixed_companies = []
+    needs_review = []
+    for c in facts:
+        if not (c.flags and c.has_report_this_cycle):
+            continue
+        only_qa_fixes = all(
+            isinstance(f, str) and f.startswith("QA-fixed:") for f in c.flags
+        )
+        if only_qa_fixes:
+            qa_fixed_companies.append(c.canonical_name)
+        else:
+            needs_review.append(c.canonical_name)
+    if qa_fixed_companies:
+        print(f"   ℹ️ QA-fixed (informational, see speaker notes): {', '.join(qa_fixed_companies)}")
+    if needs_review:
+        print(f"   ⚠️ Needs review (warnings or errors, see speaker notes): {', '.join(needs_review)}")
     print("=" * 70)
     return report
 

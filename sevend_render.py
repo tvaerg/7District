@@ -302,7 +302,7 @@ def _neutralise_row(table, row: int) -> None:
 # write the company name into the first block as a header so each is labelled.
 
 _ROW_Y = [5.0, 7.2, 9.3, 11.4]   # approximate top (inches) of each content row
-_ROW_TOL = 1.0                    # vertical tolerance for matching a box to a row
+_ROW_TOL = 0.6                    # vertical tolerance for matching a box to a row
 _COL_SPLIT_IN = 13.0              # x < split = left column, else right
 
 
@@ -314,10 +314,18 @@ def _emu_in(v) -> float:
 def _collect_update_slots(slide):
     """Return {(col, row): content_shape} for the long-text content boxes, plus
     {(col, row): ellipse_shape} for the status balls, keyed by column (0=left,
-    1=right) and row (0-3). Matching is purely positional, so it is robust to the
-    differing shape order across slides 3-6."""
+    1=right) and row (0-3). Matching is purely positional, so it is robust to:
+      - differing shape order across slides 3-7
+      - empty template content boxes (newly-added Visiba/Devant/Qamcom slots
+        have no placeholder text and would fail a text-length filter)
+    The content column for an update is approx x=5.5 (left) or x=17.4 (right);
+    labels and headers sit at different x positions and are correctly skipped.
+    """
     content: dict[tuple[int, int], object] = {}
     ellipses: list[tuple[float, float, object]] = []
+    # X positions of the CONTENT (update text) column on each side.
+    CONTENT_X_LEFT, CONTENT_X_RIGHT = 5.5, 17.4
+    CONTENT_X_TOL = 1.0
     for shape in slide.shapes:
         x, y = _emu_in(shape.left), _emu_in(shape.top)
         if x < 0 or y < 0:
@@ -326,13 +334,17 @@ def _collect_update_slots(slide):
         if "Ellips" in shape.name:
             ellipses.append((x, y, shape))
             continue
-        if shape.has_text_frame and "Rektangel" in shape.name:
-            t = shape.text_frame.text.strip()
-            if len(t) > 40:  # a content box (carries real update prose)
-                for ri, ry in enumerate(_ROW_Y):
-                    if abs(y - ry) <= _ROW_TOL:
-                        content[(col, ri)] = shape
-                        break
+        if not (shape.has_text_frame and "Rektangel" in shape.name):
+            continue
+        # Position check: is this in the CONTENT column (not the label column)?
+        target_content_x = CONTENT_X_LEFT if col == 0 else CONTENT_X_RIGHT
+        if abs(x - target_content_x) > CONTENT_X_TOL:
+            continue
+        # Row check: does it sit at one of the four content-row Y positions?
+        for ri, ry in enumerate(_ROW_Y):
+            if abs(y - ry) <= _ROW_TOL:
+                content[(col, ri)] = shape
+                break
     return content, ellipses
 
 
@@ -359,28 +371,45 @@ def _set_shape_text(shape, text: str) -> None:
         tf.text = text
 
 
-def _trim_bullet(text: str, max_words: int = 20, max_chars: int = 120) -> str:
-    """Cap a single bullet so it can't blow out the box. The caps match the
-    template's actual readable density (~4 bullets per block, ~2 lines each).
+def _trim_bullet(text: str, max_words: int = 22, max_chars: int = 135) -> str:
+    """Backstop only -- the prompt instructs Opus to cap at 18 words, so this
+    rarely fires now. When it does, it's the final defence against a genuinely
+    runaway bullet that would also blow auto-fit. Caps slightly above the
+    prompt's 18 so the routine 19-word miss does not visibly truncate.
 
-    A semicolon-packed multi-fact bullet still gets cut to the first fact --
-    the prompt asks for one fact per bullet and packing is the model's bug,
-    not legitimate length.
+    A semicolon is a legitimate way to join two related figures in one bullet,
+    so we do NOT split on it unconditionally. We only shed material when the
+    bullet genuinely overflows the word/char budget -- and even then we drop
+    whole trailing clauses at semicolon boundaries first, so what remains still
+    reads as complete facts rather than a fact cut mid-sentence.
     """
     t = (text or "").strip()
     if not t:
         return t
     cut = False
-    # If the model crammed multiple facts with ';', keep just the first.
-    if ";" in t:
-        t = t.split(";", 1)[0].strip()
-        cut = True
-    words = t.split()
-    if len(words) > max_words:
-        words = words[:max_words]; cut = True
-    t = " ".join(words)
-    if len(t) > max_chars:
-        t = t[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:."); cut = True
+    # Nothing to do unless the bullet actually overflows the budget. (The old
+    # code split on ';' here regardless of length, which silently discarded the
+    # second clause and all its numbers, then stamped a misleading "…" on
+    # bullets that fit fine -- the truncation "ghost".)
+    if len(t) > max_chars or len(t.split()) > max_words:
+        # 1. Shed whole trailing clauses at ';' boundaries while still over budget.
+        if ";" in t:
+            parts = [p.strip() for p in t.split(";") if p.strip()]
+            while len(parts) > 1 and (
+                len("; ".join(parts)) > max_chars
+                or len("; ".join(parts).split()) > max_words
+            ):
+                parts.pop()
+                cut = True
+            t = "; ".join(parts)
+        # 2. Word cap as the next defence.
+        words = t.split()
+        if len(words) > max_words:
+            words = words[:max_words]; cut = True
+        t = " ".join(words)
+        # 3. Char cap as the final defence, cutting at a word boundary.
+        if len(t) > max_chars:
+            t = t[:max_chars].rsplit(" ", 1)[0].rstrip(" ,;:."); cut = True
     return (t.rstrip(" ,;:.") + "…") if cut else t
 
 
@@ -484,6 +513,26 @@ def _set_cell_fill_shape(shape, hex_color: str) -> None:
     shape.fill.fore_color.rgb = RGBColor.from_string(hex_color)
 
 
+def _has_fatal_flag(c) -> bool:
+    """A company is RENDERABLE even when its flags list is non-empty -- QA
+    fixes, language warnings, and other informational signals are *helpful* and
+    should not cause us to blank the slot. Only catastrophic flags (reasoning
+    couldn't run, output truncated, hard QA error) should suppress rendering.
+    Anything else is by-design transparency, not failure."""
+    if not c.flags:
+        return False
+    fatal_prefixes = (
+        "Opus output truncated",
+        "Opus returned unparseable JSON",
+        "Missing field in Opus output",
+        "Reasoning error",
+        "Reasoning skipped",
+        "No report this cycle",
+        "Unknown reasoning failure",
+    )
+    return any(f.startswith(p) for p in fatal_prefixes for f in c.flags if isinstance(f, str))
+
+
 def render_update_slides(prs: Presentation, report: PortfolioReport) -> None:
     """Fill update slides (3-6), pinning each company to ITS slot so it always
     sits under its own logo (see UPDATE_SLOT_MAP in the registry).
@@ -502,7 +551,7 @@ def render_update_slides(prs: Presentation, report: PortfolioReport) -> None:
             continue
         content, ellipses = _collect_update_slots(prs.slides[si])
         c = by_name.get(company_name.lower())
-        if c is not None and c.has_report_this_cycle and not c.flags:
+        if c is not None and c.has_report_this_cycle and not _has_fatal_flag(c):
             _fill_company_column(content, ellipses, col, c)
         else:
             # Pinned company absent/failed this cycle -> blank the slot cleanly.
@@ -512,7 +561,7 @@ def render_update_slides(prs: Presentation, report: PortfolioReport) -> None:
     # but the slot map wasn't updated).
     pinned = {n.lower() for n in UPDATE_SLOT_MAP.values()}
     for c in report.companies:
-        if c.has_report_this_cycle and not c.flags and c.canonical_name.lower() not in pinned:
+        if c.has_report_this_cycle and not _has_fatal_flag(c) and c.canonical_name.lower() not in pinned:
             unplaced.append(c.canonical_name)
     if unplaced:
         print(f"   ⚠️ Reporting companies with no update-slide slot (add to "

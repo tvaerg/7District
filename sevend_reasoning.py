@@ -118,13 +118,25 @@ Rules:
   not here -- the reasoning is preserved in full; the cell is just the label.
 - covenant_issue is ALSO a short standard value, max 3 words: "No", "Yes, breach", "In
   discussion", "Waiver sought", or "n/a". Never a sentence like "No covenant breach reported".
-- bullets: 3 per update block (the template's norm). Each bullet is a substantive
-  point of up to ~18 words, MAX 20. Include concrete figures and qualifiers where the report
-  supports it (e.g. "Q1 EBITDA -0.7 MSEK, beats budget by +0.4, but FX drags other income").
-  Single fact per bullet -- do not chain unrelated facts with semicolons. Concrete over generic.
-- sevend_focus: 3-4 items, same ~18-word/20-word maximum. These are owner ACTIONS, not
-  observations -- "Continue to support CEO in turnaround", "Evaluate add-on acquisitions",
-  "Map out long-term strategic alternatives for divestment".
+- bullets: 3 per update block. Each bullet is HARD CAPPED at 18 WORDS. Count them. If you write
+  a 20-word bullet, you have failed the instruction. Numbers + names + outcomes; cut filler.
+  GOOD examples (real density, fits a slide):
+    "Q1 sales 25 MSEK, beat target by 0.8 MSEK (+3%)"          (12 words)
+    "March EBITDA -0.72 MSEK vs budget -1.11 MSEK"              (8 words)
+    "MRR 2.13 MSEK, +38.4% YoY, +2.1% vs budget"               (10 words)
+    "New wins: Mack 9 MSEK, AB Volvo OneCX, Hyundai and Audi"   (11 words)
+    "Pipeline 160.5 MSEK ex-lost, 19% of 2026 target sold"     (10 words)
+  BAD examples (too many words, get truncated by the renderer):
+    "Major wins: Mack 9 MSEK volume, 3-year OneCX subscription AB Volvo (VTG, MACK and VTNA), new Hyundai and Audi in pipeline"  (21 words)
+    "China posts best month ever, driven by Momenta, Baruto and Triv with strong follow-through across other accounts"  (18 words but flabby)
+  Single fact per bullet. No semicolons chaining unrelated points. Drop parentheticals (VTG, MACK)
+  that don't add information at slide-density. Prefer figures over adjectives. NEVER end a bullet
+  with '...' or '…' -- bullets are complete thoughts, not trailing-off teasers. If you can't say
+  it in a complete short sentence, drop the bullet.
+- sevend_focus: 3-4 items, same 18-word cap. Owner ACTIONS, not observations.
+  GOOD: "Close Viking/KPO injection before August cash cliff"  (7 words)
+  GOOD: "Track 56.7 MSEK receivables build, validate collection quality"  (8 words)
+  BAD:  "Continue to support management in scaling China momentum and new product launches"  (12 words but mostly filler -- could be "Support China scale-up and new product launches")
 - FINANCING: set has_active_issue=true ONLY if the report shows a real financing problem or event
   (covenant breach/discussion, refinancing need, capital raise in play, runway concern). If false,
   leave amount/type/sevend_amount/timing/sevend_rescue_amount as "n/a".

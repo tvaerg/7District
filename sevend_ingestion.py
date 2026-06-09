@@ -73,6 +73,7 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-3.1-pro-preview")  # nat
 _PDF_EXTS = {".pdf"}
 _PPTX_EXTS = {".pptx", ".ppt"}
 _XLSX_EXTS = {".xlsx", ".xlsm"}
+_DOCX_EXTS = {".docx", ".doc"}
 
 # Guard rails. Reports are normally 5-25 pages; flag anything unusually large
 # before we spend tokens, but do not hard-block (operator may legitimately have
@@ -513,36 +514,94 @@ def ingest_xlsx(xlsx_path: str, rec: CompanyRecord) -> RawCompanyMaterial:
 
 
 # -----------------------------------------------------------------------------
+# DOCX PATH -- python-docx text extraction, no API
+# -----------------------------------------------------------------------------
+def ingest_docx(docx_path: str, rec: CompanyRecord) -> RawCompanyMaterial:
+    """Word document path: walk paragraphs + tables, return text. No LLM."""
+    material = RawCompanyMaterial(
+        canonical_name=rec.canonical_name, category=rec.category,
+        source_file=str(docx_path), source_kind="docx_text",
+        static=rec.display_dict(),
+    )
+    p = Path(docx_path)
+    if not p.exists():
+        material.errors.append(f"file not found: {docx_path}")
+        return material
+    if p.stat().st_size == 0:
+        material.errors.append("file is empty (0 bytes)")
+        return material
+
+    try:
+        import docx
+    except ImportError:
+        material.errors.append("python-docx not installed (pip install python-docx)")
+        return material
+
+    try:
+        doc = docx.Document(str(p))
+    except Exception as e:                             # noqa: BLE001
+        material.errors.append(f"could not open docx: {e}")
+        return material
+
+    try:
+        chunks: list[str] = []
+        for para in doc.paragraphs:
+            t = (para.text or "").strip()
+            if t:
+                chunks.append(t)
+        # Tables can carry the financial detail in management reports.
+        for tbl in doc.tables:
+            for row in tbl.rows:
+                cells = [(c.text or "").strip() for c in row.cells]
+                cells = [c for c in cells if c]
+                if cells:
+                    chunks.append(" | ".join(cells))
+        material.body_text = "\n".join(chunks).strip()
+        material.meta["paragraphs"] = len(doc.paragraphs)
+        material.meta["tables"] = len(doc.tables)
+        if not material.body_text:
+            material.warnings.append("docx parsed but no text found")
+    except Exception as e:                             # noqa: BLE001
+        material.errors.append(f"docx extraction error: {e}")
+    return material
+
+
+# -----------------------------------------------------------------------------
 # Dispatcher
 # -----------------------------------------------------------------------------
 def ingest_file(file_path: str) -> RawCompanyMaterial:
-    """Resolve company from filename, then route by extension to the right path."""
-    rec = match_file_to_company(file_path)
+    """Resolve company by reading file CONTENT (not filename), then route by
+    extension to the right ingestion path."""
+    from sevend_match import identify_company
+    rec, why = identify_company(file_path)
     if rec is None:
         m = RawCompanyMaterial(
             canonical_name="UNMATCHED", category="UNMATCHED",
             source_file=str(file_path), source_kind="unknown",
         )
         m.errors.append(
-            f"Could not map '{Path(file_path).name}' to a registry company. "
-            f"Add an alias or FILE_MAP entry in sevend_registry.py."
+            f"Could not identify '{Path(file_path).name}' as a registry company "
+            f"(reason: {why}). Add an alias to sevend_registry.py, set up a "
+            f"FILE_MAP override, or ensure the company name appears in the file."
         )
         return m
 
     ext = Path(file_path).suffix.lower()
-    print(f"   • {rec.canonical_name} ({Path(file_path).name})")
+    print(f"   • {rec.canonical_name} ({Path(file_path).name})  [{why}]")
     if ext in _PDF_EXTS:
         return ingest_pdf(file_path, rec)
     if ext in _PPTX_EXTS:
         return ingest_pptx(file_path, rec)
     if ext in _XLSX_EXTS:
         return ingest_xlsx(file_path, rec)
+    if ext in _DOCX_EXTS:
+        return ingest_docx(file_path, rec)
 
     m = RawCompanyMaterial(
         canonical_name=rec.canonical_name, category=rec.category,
         source_file=str(file_path), source_kind="unknown", static=rec.display_dict(),
     )
-    m.errors.append(f"Unsupported file type: {ext} (expected .pdf, .pptx, or .xlsx)")
+    m.errors.append(f"Unsupported file type: {ext} (expected .pdf, .pptx, .xlsx, or .docx)")
     return m
 
 
