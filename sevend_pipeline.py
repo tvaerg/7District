@@ -245,23 +245,42 @@ def run_pipeline(files: list[str], cycle_label: str, ceo_update: str = "",
     print("\n" + "=" * 70)
     print(f"✅ Wrote {out}")
     print("   Review and edit the .pptx directly in PowerPoint if needed.")
-    # Two signal classes, distinct concerns:
-    # - QA-fixed: informational, the engine corrected something via the QA pass.
-    # - Other flags: real issues (language warnings, QA errors, reasoning failures).
+    # Three signal classes, distinct concerns:
+    # - Needs review: genuine issues only -- QA errors, reasoning failures,
+    #   whole-Swedish bullets, or any other unexpected flag. These DO need a
+    #   reviewer before the deck ships.
+    # - QA-fixed: the engine corrected something via the QA pass. Informational.
+    # - Language nudge: a "language:" flag, e.g. a stray Swedish word (tjansteman)
+    #   or a figure the unit heuristic questioned. Not blocking, but the reviewer
+    #   should eyeball these lines before sending -- so we print them explicitly
+    #   rather than leaving them silent.
+    INFORMATIONAL_PREFIXES = ("QA-fixed:", "language:")
     qa_fixed_companies = []
     needs_review = []
+    language_nudges = []
     for c in facts:
         if not (c.flags and c.has_report_this_cycle):
             continue
-        only_qa_fixes = all(
+        real_issues = [
+            f for f in c.flags
+            if isinstance(f, str) and not f.startswith(INFORMATIONAL_PREFIXES)
+        ]
+        has_qa_fix = any(
             isinstance(f, str) and f.startswith("QA-fixed:") for f in c.flags
         )
-        if only_qa_fixes:
-            qa_fixed_companies.append(c.canonical_name)
-        else:
+        has_language = any(
+            isinstance(f, str) and f.startswith("language:") for f in c.flags
+        )
+        if real_issues:
             needs_review.append(c.canonical_name)
+        elif has_qa_fix:
+            qa_fixed_companies.append(c.canonical_name)
+        if has_language:
+            language_nudges.append(c.canonical_name)
     if qa_fixed_companies:
         print(f"   ℹ️ QA-fixed (informational, see speaker notes): {', '.join(qa_fixed_companies)}")
+    if language_nudges:
+        print(f"   📝 Language: eyeball these for stray Swedish/units (see debug JSON): {', '.join(language_nudges)}")
     if needs_review:
         print(f"   ⚠️ Needs review (warnings or errors, see speaker notes): {', '.join(needs_review)}")
     print("=" * 70)

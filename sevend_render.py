@@ -499,7 +499,10 @@ def _fill_company_column(content, ellipses, col: int, c: CompanyFacts) -> None:
     # 7D focus (row 3, no RAG ball).
     focus_shape = content.get((col, 3))
     if focus_shape is not None:
-        _set_bullets(focus_shape, c.sevend_focus, header="7D focus and contribution")
+        # The reasoning prompt asks for 3-4 focus items, so the renderer must
+        # allow 4 here. The default cap of 3 silently dropped the 4th 7D action
+        # on every company that produced four -- the actions Anders steers on.
+        _set_bullets(focus_shape, c.sevend_focus, header="7D focus and contribution", max_bullets=4)
 
 
 def _set_cell_fill_shape(shape, hex_color: str) -> None:
@@ -626,6 +629,54 @@ def _resolve_template(template_path: str) -> str:
     )
 
 
+# Swedish -> English month names, so the heatmap title is always English even if
+# the operator passes a Swedish --cycle (e.g. "Maj 2026" renders as "May 2026").
+_MONTHS_EN = {
+    "january": "January", "february": "February", "march": "March",
+    "april": "April", "may": "May", "june": "June", "july": "July",
+    "august": "August", "september": "September", "october": "October",
+    "november": "November", "december": "December",
+}
+_MONTHS_SV = {
+    "januari": "January", "februari": "February", "mars": "March",
+    "april": "April", "maj": "May", "juni": "June", "juli": "July",
+    "augusti": "August", "september": "September", "oktober": "October",
+    "november": "November", "december": "December",
+}
+_MONTH_MAP = {**_MONTHS_EN, **_MONTHS_SV}
+
+_HEATMAP_TITLE_BASE = "Portfolio Company Heatmap"
+
+
+def _englishify_cycle(cycle_label: str) -> str:
+    """Return the cycle label with any month token rendered in English."""
+    out = []
+    for tok in (cycle_label or "").split():
+        out.append(_MONTH_MAP.get(tok.lower(), tok))
+    return " ".join(out)
+
+
+def _stamp_heatmap_period(prs: Presentation, cycle_label: str) -> None:
+    """Append the cycle period to the heatmap slide title, e.g.
+    'Portfolio Company Heatmap - April 2026'. Month is driven by --cycle and
+    always rendered in English. The rest of the heatmap stays manual (untouched).
+    Idempotent: rebuilt from a fixed base so a re-run never double-appends.
+    """
+    cyc = _englishify_cycle(cycle_label).strip()
+    if not cyc:
+        return
+    try:
+        slide = prs.slides[1]  # slide 2 (0-indexed) -- the heatmap
+    except (IndexError, KeyError):
+        return
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        if shape.text_frame.text.strip().startswith(_HEATMAP_TITLE_BASE):
+            _set_shape_text(shape, f"{_HEATMAP_TITLE_BASE} - {cyc}")
+            return
+
+
 def render_report(report: PortfolioReport, template_path: str, out_path: str) -> str:
     """Render the deck from the template. Returns the output path.
 
@@ -634,11 +685,15 @@ def render_report(report: PortfolioReport, template_path: str, out_path: str) ->
     template. The engine only fills the per-company update slides (3-6), where
     monthly content actually changes. `render_heatmap` remains in this module
     in case the policy is ever reversed -- it just isn't called.
+
+    The one heatmap element the engine DOES set is the period in the slide
+    title (driven by --cycle), so every deck states which month it covers.
     """
     template_path = _resolve_template(template_path)
     prs = Presentation(template_path)
 
     # render_heatmap(prs, report)   # disabled by 7D policy -- heatmap is manual
+    _stamp_heatmap_period(prs, report.cycle_label)  # but stamp the period on its title
     render_update_slides(prs, report)
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)

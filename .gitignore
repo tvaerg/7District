@@ -13,20 +13,20 @@
 *.xls
 *.csv
 
-# ...men behall PowerPoint-mallen som kravs for att kora motorn.
-# Negeringen aterinkluderar allt under assets/ aven om det matchar ovan.
+# ...men behåll PowerPoint-mallen som krävs för att köra motorn.
+# Negeringen återinkluderar allt under assets/ även om det matchar ovan.
 !assets/
 !assets/**
 
-# Genererade deckar och deras debug-dumpar (innehaller ocksa klientsiffror).
+# Genererade deckar och deras debug-dumpar (innehåller också klientsiffror).
 output/
 
-# Hemligheter och miljo.
+# Hemligheter och miljö.
 .env
 .env.*
 !.env.example
 
-# Python-skrap.
+# Python-skräp.
 venv/
 .venv/
 __pycache__/

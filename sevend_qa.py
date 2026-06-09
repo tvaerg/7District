@@ -203,7 +203,95 @@ def language_scrub(cf: CompanyFacts) -> CompanyFacts:
 
     if issues:
         cf.flags.extend(f"language: {i}" for i in issues)
+
+    # Non-English (Swedish) detection, two sensitivities:
+    #
+    #  1. Whole-prose Swedish (2+ distinct Swedish function words in one string)
+    #     is a REAL issue -- flagged WITHOUT a prefix so it lands in the pipeline's
+    #     "Needs review" bucket. This catches a bullet Opus wrote entirely in
+    #     Swedish (e.g. mirroring a Swedish Manadsrapport).
+    #
+    #  2. A stray Swedish word -- a single token carrying a/a/o (e.g. "tjansteman",
+    #     "ovrig personal") inside an otherwise-English bullet -- is flagged as an
+    #     informational "language:" nudge. The prompt forces English, but LLM
+    #     output drifts a word now and then; this surfaces exactly which lines to
+    #     eyeball before a deck ships. It is a nudge (not "Needs review") because
+    #     it can also fire on legitimate Nordic proper nouns (Boras, Malmo, Vast).
+    for label, text in _all_output_strings(cf):
+        # Over-length bullets: the renderer hard-trims any bullet past its width
+        # budget and appends an ellipsis, which reads as unfinished on a client
+        # deck (e.g. "...new EU wins Hyundai &..."). Flag it BEFORE render as a
+        # real issue so the reviewer can shorten or split it -- a truncation must
+        # never ship unseen. Heatmap labels have their own short-label budget and
+        # are not bullets, so this applies to bullet/focus strings only.
+        is_bullet = (".bullet " in label) or label.startswith("sevend_focus")
+        if is_bullet and text and (
+            len(text) > _RENDER_BULLET_MAX_CHARS
+            or len(text.split()) > _RENDER_BULLET_MAX_WORDS
+        ):
+            cf.flags.append(
+                f"Bullet exceeds deck width, will be truncated on the slide ({label}): {text!r}"
+            )
+        if _looks_swedish(text):
+            cf.flags.append(f"Non-English text in {label}: {text!r}")
+        else:
+            sv_words = _swedish_chars_words(text)
+            if sv_words:
+                cf.flags.append(
+                    f"language: possible Swedish word(s) {sv_words} in {label}: {text!r}"
+                )
     return cf
+
+
+# Mirror of the renderer's bullet budget (_trim_bullet in sevend_render.py).
+# Keep these in sync: if the renderer's limits change, change them here too.
+_RENDER_BULLET_MAX_CHARS = 135
+_RENDER_BULLET_MAX_WORDS = 22
+
+
+# Tokens carrying Swedish-only characters. We report the offending word(s) so a
+# reviewer can tell a real leak ("tjansteman") from a place name ("Boras").
+_AAO_RE = re.compile(r"[åäö]", re.IGNORECASE)
+
+
+def _swedish_chars_words(text: str) -> list[str]:
+    if not text:
+        return []
+    return [t for t in _WORD_TOKEN_RE.findall(text) if _AAO_RE.search(t)]
+
+
+# Swedish function words with no English collision. Two or more DISTINCT hits in
+# one string is a near-certain tell that the string is Swedish prose, while a
+# lone Nordic place name (Boras, Malmo) won't trip it.
+_SWEDISH_MARKERS = frozenset({
+    "och", "for", "är", "ar", "att", "varav", "ingen", "inte", "eller",
+    "fran", "från", "samt", "enligt", "vant", "väntan", "vantan", "manaden",
+    "månaden", "roda", "röda", "pausad", "uppskattad", "gjord", "olyckor",
+    "franvaro", "frånvaro", "rakor", "räkor", "inkopspris", "inköpspris",
+    "ravarubrist", "råvarubrist", "oversyn", "översyn", "langtidssjuka",
+})
+_WORD_TOKEN_RE = re.compile(r"[a-zåäö]+", re.IGNORECASE)
+
+
+def _looks_swedish(text: str) -> bool:
+    if not text:
+        return False
+    toks = {t.lower() for t in _WORD_TOKEN_RE.findall(text)}
+    return len(toks & _SWEDISH_MARKERS) >= 2
+
+
+def _all_output_strings(cf: CompanyFacts):
+    """Yield (label, text) for every human-readable string the deck renders."""
+    yield "investment_thesis", cf.investment_thesis.effective_text
+    yield "performance", cf.performance.effective_text
+    yield "financing.summary", cf.financing.summary.effective_text
+    for label, blk in (("operational", cf.operational),
+                       ("financial", cf.financial),
+                       ("three_year", cf.three_year)):
+        for i, b in enumerate(blk.effective_bullets, 1):
+            yield f"{label}.bullet {i}", b
+    for i, x in enumerate(cf.sevend_focus, 1):
+        yield f"sevend_focus[{i}]", x
 
 
 # -----------------------------------------------------------------------------
