@@ -1,0 +1,9 @@
+anthropic
+google-generativeai
+python-pptx
+python-docx
+openpyxl
+pypdf
+pydantic
+pyyaml
+python-dotenv
